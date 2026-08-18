@@ -394,6 +394,7 @@ def repair_onepager(broken_path, gold_path, partner, out_path, header='auto', no
     else:
         die('one-pager photo region state: ' + st)
     im.save(out_path)
+    normalize_onepager(out_path, norm_gap, norm_margin)
     return dict(bar_band=(bb0, bb1), photo=ph_sq, fine_dy=dy)
 
 # ------------------------------------------------------- banner and cover
