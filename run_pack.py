@@ -42,8 +42,14 @@ def manifest(d):
     docs = {f.rsplit(' - ', 1)[1].rsplit('.', 1)[0]: os.path.join(d, f) for f in files}
     return full, docs
 
-def gold_paths(repo, audience, leader_dir):
-    pre = {"sales": "individual", "agency": "group"}[audience]
+def template_family(op_path):
+    w = Image.open(op_path).size[0]
+    fam = {2380: "individual", 2386: "group"}.get(w)
+    if not fam: fail(f"one-pager width {w}px matches no known template family (2380 or 2386); send to Cole")
+    return fam
+
+def gold_paths(repo, family, leader_dir, broken_op_width):
+    pre = family
     g = {"cc": os.path.join(repo, f"{pre}-gold-cold-call-openers.pdf"),
          "report": os.path.join(repo, f"{pre}-gold-report.pdf"),
          "onepager": os.path.join(repo, f"{pre}-gold-onepager.png"),
@@ -53,6 +59,17 @@ def gold_paths(repo, audience, leader_dir):
         _, ldocs = manifest(leader_dir)
         m = {"cc": "Cold Call Openers", "report": "Benchmark Report",
              "onepager": "Benchmark One-Pager", "banner": "Banner", "cover": "Cover"}
+        if "Cold Call Openers" not in ldocs or "Benchmark One-Pager" not in ldocs:
+            fail("reference pack is incomplete; use a full healthy pack or omit --gold-zip")
+        ldoc = fitz.open(ldocs["Cold Call Openers"])
+        has_coupon = any('coupon=' in l.get('uri', '') for i in range(ldoc.page_count)
+                         for l in ldoc[i].get_links())
+        ldoc.close()
+        if not has_coupon:
+            fail("the reference pack is broken too (no coupon links inside); it needs its own repair first. Rerun without --gold-zip to use the standard gold")
+        lw = Image.open(ldocs["Benchmark One-Pager"]).size[0]
+        if lw != broken_op_width:
+            fail(f"reference pack template ({lw}px) does not match this pack ({broken_op_width}px); rerun without --gold-zip")
         for k, doc in m.items():
             if doc in ldocs: g[k] = ldocs[doc]
     for k, p_ in g.items():
@@ -278,7 +295,13 @@ def main():
     broken = unzip_to(a.zip, os.path.join(work, 'broken'))
     leader = unzip_to(a.gold_zip, os.path.join(work, 'leader')) if a.gold_zip else None
     full, docs = manifest(broken)
-    gold = gold_paths(repo, a.audience, leader)
+    if 'Benchmark One-Pager' not in docs: fail("pack has no Benchmark One-Pager")
+    fam = template_family(docs['Benchmark One-Pager'])
+    conventional = {"sales": "individual", "agency": "group"}[a.audience]
+    if fam != conventional:
+        print(f"note: this pack uses the {fam}-run template; matching golds selected automatically "
+              f"(audience '{a.audience}' kept for labeling)")
+    gold = gold_paths(repo, fam, leader, Image.open(docs['Benchmark One-Pager']).size[0])
     guides = [g for g in docs if g in KNOWN_GUIDES]
     unknown = [g for g in docs if g not in KNOWN_GUIDES + ['Benchmark Report', 'Benchmark One-Pager', 'Banner', 'Cover']]
     if unknown: fail(f"unrecognized documents (send to Cole before shipping): {unknown}")
@@ -306,7 +329,7 @@ def main():
     code_pages['Benchmark Report'] = [1, 2]
     opw, opgap, opm = gold_op_metrics(gold['onepager'])
     op_out = os.path.join(out_dir, f"{a.name} - Benchmark One-Pager.png")
-    op_header = 'skip' if (pm == 'keep' or a.audience == 'agency') else 'auto'
+    op_header = 'skip' if (pm == 'keep' or fam == 'group') else 'auto'
     P.repair_onepager(docs['Benchmark One-Pager'], gold['onepager'], partner, op_out,
                       header=op_header, norm_gap=67, norm_margin=opm)
     if a.headshot and not a.keep_avatar:
