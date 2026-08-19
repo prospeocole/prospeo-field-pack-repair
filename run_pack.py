@@ -87,24 +87,63 @@ def gold_link_census(gdoc, gcode):
     return cen
 
 def photo_blob_d(gold_png, kind):
-    region = {"banner": (30, 80, 620, 700), "cover": (1700, 120, 2160, 650)}[kind]
+    region = {"banner": (30, 80, 620, 700), "cover": (1700, 120, 2160, 650),
+              "onepager": (1900, 60, 2350, 420)}[kind]
     a = P.arr(Image.open(gold_png))
     m = P.ink_mask(a[region[1]:region[3], region[0]:region[2]], 230)
     bb = P.blob_bbox(m)
-    if not bb: fail(f"gold {kind} photo not measurable")
+    if not bb: raise SystemExit("gold " + kind + " photo not measurable")
     return max(bb[2] - bb[0], bb[3] - bb[1])
 
-def repair_flat_with_photo(src_png, gold_png, partner, dst, kind, headshot):
+PHOTO_REGIONS = {"banner": (20, 60, 700, 720), "cover": (1650, 80, 2160, 700),
+                 "onepager": (1850, 50, 2386, 430)}
+
+def detect_disc(a, region, min_px=6000):
+    x0, y0, x1, y1 = region
+    reg = a[y0:y1, x0:x1].astype(int)
+    flat = reg.reshape(-1, 3)
+    keep = flat[(flat.min(axis=1) < 235)]
+    if len(keep) < min_px: return None
+    bins, counts = np.unique(keep // 24, axis=0, return_counts=True)
+    for idx in np.argsort(-counts)[:4]:
+        if counts[idx] < min_px: break
+        sel = keep[(keep // 24 == bins[idx]).all(axis=1)]
+        med = np.median(sel, axis=0)
+        if med.max() - med.min() < 18 and med.mean() > 150:
+            continue
+        mask = np.abs(reg - med).max(axis=2) < 26
+        if mask.sum() < min_px: continue
+        bb = P.blob_bbox(mask)
+        if not bb: continue
+        w, h = bb[2] - bb[0], bb[3] - bb[1]
+        if w < 90 or h < 90 or not (0.65 < w / h < 1.55): continue
+        sub = mask[bb[1]:bb[3], bb[0]:bb[2]]
+        if sub.mean() < 0.45: continue    # a disc fills most of its box even with initials punched out
+        return (x0 + bb[0], y0 + bb[1], x0 + bb[2], y0 + bb[3])
+    return None
+
+def paste_over_disc(dst_path, disc, gold_png, kind, headshot):
+    d_disc = max(disc[2] - disc[0], disc[3] - disc[1]) + 8
+    try:
+        d_gold = photo_blob_d(gold_png, kind)
+        d_t = d_gold if abs(d_gold - d_disc) < 0.35 * d_disc else d_disc
+    except SystemExit:
+        d_t = d_disc
+    cx, cy = (disc[0] + disc[2]) // 2, (disc[1] + disc[3]) // 2
+    out = Image.open(dst_path).convert('RGB')
+    c = P.circular(headshot, d_t)
+    out.paste(c, (cx - d_t // 2, cy - d_t // 2), c)
+    out.save(dst_path)
+
+def repair_flat_with_photo(src_png, gold_png, partner, dst, kind, headshot, keep_avatar):
     a0 = P.arr(Image.open(src_png).convert('RGB'))
-    r, g, b = a0[:, :, 0].astype(int), a0[:, :, 1].astype(int), a0[:, :, 2].astype(int)
-    om = (np.abs(r - 158) < 25) & (np.abs(g - 134) < 25) & (np.abs(b - 64) < 28)
-    disc = P.blob_bbox(om) if om.sum() > 8000 else None
+    disc = None if keep_avatar else detect_disc(a0, PHOTO_REGIONS[kind])
     tail = partner['full'] != partner['clean']
-    if not disc and not tail and not headshot:
+    if not disc and not tail:
         shutil.copy(src_png, dst); return
     work = src_png
     if disc:
-        if not headshot: fail(f"{kind} shows an initials avatar but no headshot was attached")
+        if not headshot: fail(kind + " shows an initials avatar but no headshot was attached (or pass --keep-avatar to ship as-is)")
         im = Image.open(src_png).convert('RGB')
         P.grad_fill(im, a0, disc[0] - 8, disc[1] - 8, disc[2] + 8, disc[3] + 8, gap=14, depth=18)
         work = tempfile.mktemp(suffix='.png'); im.save(work)
@@ -113,14 +152,9 @@ def repair_flat_with_photo(src_png, gold_png, partner, dst, kind, headshot):
     else:
         shutil.copy(work, dst)
     if disc:
-        d_t = photo_blob_d(gold_png, kind)
-        cx, cy = (disc[0] + disc[2]) // 2, (disc[1] + disc[3]) // 2
-        out = Image.open(dst).convert('RGB')
-        c = P.circular(headshot, d_t)
-        out.paste(c, (cx - d_t // 2, cy - d_t // 2), c)
-        out.save(dst)
+        paste_over_disc(dst, disc, gold_png, kind, headshot)
 
-def audit(partner, docs_in, out_dir, gold, code_pages, census, opw, opm):
+def audit(partner, docs_in, out_dir, gold, code_pages, census, opw, opm, headshot, keep_avatar):
     fails = []
     for doc_name, pages in code_pages.items():
         din = fitz.open(docs_in[doc_name])
@@ -164,6 +198,11 @@ def audit(partner, docs_in, out_dir, gold, code_pages, census, opw, opm):
     r, g, b = a[:, :, 0].astype(int), a[:, :, 1].astype(int), a[:, :, 2].astype(int)
     if ((g > 88) & (g > r + 25) & (g > b + 12) & (r < 190))[-900:, 600:1200].sum() < 400:
         fails.append("one-pager: code ink missing in bar")
+    if headshot and not keep_avatar:
+        for png_name, key in [("Banner", "banner"), ("Cover", "cover"), ("Benchmark One-Pager", "onepager")]:
+            ap_ = P.arr(Image.open(os.path.join(out_dir, partner['clean'] + " - " + png_name + ".png")).convert('RGB'))
+            if detect_disc(ap_, PHOTO_REGIONS[key]):
+                fails.append(png_name + ": initials avatar still present")
     return fails
 
 def proof(partner, docs_in, out_dir, gold, out_jpg):
@@ -231,6 +270,7 @@ def main():
     ap.add_argument('--zip', required=True); ap.add_argument('--name', required=True)
     ap.add_argument('--code', required=True); ap.add_argument('--audience', required=True, choices=['sales', 'agency'])
     ap.add_argument('--headshot'); ap.add_argument('--gold-zip')
+    ap.add_argument('--keep-avatar', action='store_true')
     a = ap.parse_args()
     if not re.fullmatch(r'[A-Z]{3,}50', a.code): fail(f"code '{a.code}' does not match the FIRSTNAMEL50 format")
     repo = os.path.dirname(os.path.abspath(__file__))
@@ -242,7 +282,7 @@ def main():
     guides = [g for g in docs if g in KNOWN_GUIDES]
     unknown = [g for g in docs if g not in KNOWN_GUIDES + ['Benchmark Report', 'Benchmark One-Pager', 'Banner', 'Cover']]
     if unknown: fail(f"unrecognized documents (send to Cole before shipping): {unknown}")
-    pm = photo_plan(docs, a.headshot)
+    pm = ('replace' if a.headshot else 'keep') if a.keep_avatar else photo_plan(docs, a.headshot)
     partner = dict(full=full, clean=a.name, code=a.code,
                    uri=f'https://prospeo.io/pricing?coupon={a.code}',
                    photo=a.headshot, photo_mode=pm)
@@ -265,12 +305,21 @@ def main():
     doc.close(); pristine.close()
     code_pages['Benchmark Report'] = [1, 2]
     opw, opgap, opm = gold_op_metrics(gold['onepager'])
-    P.repair_onepager(docs['Benchmark One-Pager'], gold['onepager'], partner,
-                      os.path.join(out_dir, f"{a.name} - Benchmark One-Pager.png"),
-                      header='skip' if pm == 'keep' else 'auto', norm_gap=67, norm_margin=opm)
+    op_out = os.path.join(out_dir, f"{a.name} - Benchmark One-Pager.png")
+    op_header = 'skip' if (pm == 'keep' or a.audience == 'agency') else 'auto'
+    P.repair_onepager(docs['Benchmark One-Pager'], gold['onepager'], partner, op_out,
+                      header=op_header, norm_gap=67, norm_margin=opm)
+    if a.headshot and not a.keep_avatar:
+        a_op = P.arr(Image.open(op_out).convert('RGB'))
+        disc = detect_disc(a_op, PHOTO_REGIONS['onepager'])
+        if disc:
+            im_op = Image.open(op_out).convert('RGB')
+            P.grad_fill(im_op, a_op, disc[0] - 6, disc[1] - 6, disc[2] + 6, disc[3] + 6, gap=12, depth=16)
+            im_op.save(op_out)
+            paste_over_disc(op_out, disc, gold['onepager'], 'onepager', a.headshot)
     for kind, nm in [('banner', 'Banner'), ('cover', 'Cover')]:
         repair_flat_with_photo(docs[nm], gold[kind], partner,
-                               os.path.join(out_dir, f"{a.name} - {nm}.png"), kind, a.headshot)
+                               os.path.join(out_dir, f"{a.name} - {nm}.png"), kind, a.headshot, a.keep_avatar)
     census = {}
     for g in code_pages:
         din_ = fitz.open(docs[g])
@@ -287,7 +336,7 @@ def main():
                 cen[din_.page_count] = cen.get(din_.page_count, 0) + 3
         din_.close()
         census[g] = cen
-    fails = audit(partner, docs, out_dir, gold, code_pages, census, opw, opm)
+    fails = audit(partner, docs, out_dir, gold, code_pages, census, opw, opm, a.headshot, a.keep_avatar)
     pack_kind = 'Field' if a.audience == 'sales' else 'Group'
     zname = os.path.join(OUT, f"{a.name} - Prospeo {pack_kind} Pack.zip")
     with zipfile.ZipFile(zname, 'w', zipfile.ZIP_DEFLATED) as z:
